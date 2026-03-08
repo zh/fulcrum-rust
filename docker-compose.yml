@@ -1,0 +1,15 @@
+services:
+  fulcrum-rust:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - FULCRUM_URL=host.docker.internal
+      - FULCRUM_PORT=50001
+      - FULCRUM_TLS=false
+      - FULCRUM_POOL_SIZE=4
+      - PORT=3000
+      - NETWORK=mainnet
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
