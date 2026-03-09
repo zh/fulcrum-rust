@@ -144,7 +144,7 @@ cargo fmt           # Format
 
 ## Docker
 
-Multi-stage build: `rust:1.83-slim` (builder) → `debian:bookworm-slim` (runtime, ~80MB).
+Multi-stage build: `rust:1.85-alpine` (builder, static musl linking) → `gcr.io/distroless/static-debian12` (runtime, ~2MB).
 
 ```bash
 # Build and run
