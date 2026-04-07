@@ -20,38 +20,223 @@ impl fmt::Display for AddressError {
 
 impl std::error::Error for AddressError {}
 
-/// Convert a cashaddr (e.g. `bitcoincash:qr...`) to the Electrum scripthash format.
+// ── Cashaddr type bytes ──────────────────────────────────────────────
+// Standard types (handled by bitcoincash-addr crate):
+//   0x00 = P2PKH (q-prefix)
+//   0x08 = P2SH  (p-prefix)
+// CashToken types (NOT handled by the crate, same hash160):
+//   0x10 = token-aware P2PKH (z-prefix)
+//   0x18 = token-aware P2SH  (r-prefix)
+const TYPE_MASK: u8 = 0x78;
+const TYPE_P2PKH: u8 = 0x00;
+const TYPE_P2SH: u8 = 0x08;
+const TYPE_TOKEN_P2PKH: u8 = 0x10;
+const TYPE_TOKEN_P2SH: u8 = 0x18;
+
+/// Script type for building the output script.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ScriptType {
+    P2PKH,
+    P2SH,
+}
+
+/// Decoded cashaddr: network prefix, script type, and hash160.
+struct DecodedAddr {
+    network: String,
+    script_type: ScriptType,
+    hash: Vec<u8>,
+}
+
+/// Decode any cashaddr including CashToken z/r-prefix addresses.
 ///
-/// Algorithm (matches JS `electrumx.js:1375-1413`):
-/// 1. Decode cashaddr → hash_type + hash160 bytes
+/// First tries the `bitcoincash-addr` crate. If it fails (e.g. on token-aware
+/// type bytes), falls back to a minimal raw decode that extracts the version
+/// byte and hash160 directly.
+fn decode_cashaddr(addr: &str) -> Result<DecodedAddr, AddressError> {
+    // Fast path: crate handles standard q/p addresses
+    if let Ok(decoded) = bitcoincash_addr::Address::decode(addr) {
+        let script_type = match decoded.hash_type {
+            bitcoincash_addr::HashType::Key => ScriptType::P2PKH,
+            bitcoincash_addr::HashType::Script => ScriptType::P2SH,
+        };
+        let network = match decoded.network {
+            bitcoincash_addr::Network::Main => "mainnet",
+            bitcoincash_addr::Network::Test => "testnet",
+            bitcoincash_addr::Network::Regtest => "regtest",
+        };
+        return Ok(DecodedAddr {
+            network: network.to_string(),
+            script_type,
+            hash: decoded.body,
+        });
+    }
+
+    // Slow path: handle token-aware z/r-prefix addresses
+    decode_token_cashaddr(addr)
+}
+
+// ── Minimal cashaddr bech32 decode for token types ──────────────────
+
+const CHARSET_REV: [Option<u8>; 128] = [
+    None,     None,     None,     None,     None,     None,     None,     None,
+    None,     None,     None,     None,     None,     None,     None,     None,
+    None,     None,     None,     None,     None,     None,     None,     None,
+    None,     None,     None,     None,     None,     None,     None,     None,
+    None,     None,     None,     None,     None,     None,     None,     None,
+    None,     None,     None,     None,     None,     None,     None,     None,
+    Some(15), None,     Some(10), Some(17), Some(21), Some(20), Some(26), Some(30),
+    Some(7),  Some(5),  None,     None,     None,     None,     None,     None,
+    None,     Some(29), None,     Some(24), Some(13), Some(25), Some(9),  Some(8),
+    Some(23), None,     Some(18), Some(22), Some(31), Some(27), Some(19), None,
+    Some(1),  Some(0),  Some(3),  Some(16), Some(11), Some(28), Some(12), Some(14),
+    Some(6),  Some(4),  Some(2),  None,     None,     None,     None,     None,
+    None,     Some(29), None,     Some(24), Some(13), Some(25), Some(9),  Some(8),
+    Some(23), None,     Some(18), Some(22), Some(31), Some(27), Some(19), None,
+    Some(1),  Some(0),  Some(3),  Some(16), Some(11), Some(28), Some(12), Some(14),
+    Some(6),  Some(4),  Some(2),  None,     None,     None,     None,     None,
+];
+
+fn polymod(v: &[u8]) -> u64 {
+    let mut c: u64 = 1;
+    for d in v.iter() {
+        let c0 = (c >> 35) as u8;
+        c = ((c & 0x0007_ffff_ffff) << 5) ^ u64::from(*d);
+        if c0 & 0x01 != 0 { c ^= 0x0098_f2bc_8e61; }
+        if c0 & 0x02 != 0 { c ^= 0x0079_b76d_99e2; }
+        if c0 & 0x04 != 0 { c ^= 0x00f3_3e5f_b3c4; }
+        if c0 & 0x08 != 0 { c ^= 0x00ae_2eab_e2a8; }
+        if c0 & 0x10 != 0 { c ^= 0x001e_4f43_e470; }
+    }
+    c ^ 1
+}
+
+fn expand_prefix(prefix: &str) -> Vec<u8> {
+    let mut ret: Vec<u8> = prefix.chars().map(|c| (c as u8) & 0x1f).collect();
+    ret.push(0);
+    ret
+}
+
+fn convert_bits(data: &[u8], inbits: u8, outbits: u8) -> Vec<u8> {
+    let num_bytes = (data.len() * inbits as usize).div_ceil(outbits as usize);
+    let mut ret = Vec::with_capacity(num_bytes);
+    let mut acc: u16 = 0;
+    let mut num: u8 = 0;
+    let groupmask = (1 << outbits) - 1;
+    for d in data.iter() {
+        acc = (acc << inbits) | u16::from(*d);
+        num += inbits;
+        while num > outbits {
+            ret.push((acc >> (num - outbits)) as u8);
+            acc &= !(groupmask << (num - outbits));
+            num -= outbits;
+        }
+    }
+    // No padding: extract remaining bits if meaningful
+    let padding = (data.len() * inbits as usize) % outbits as usize;
+    if num as usize > padding {
+        ret.push((acc >> padding) as u8);
+    }
+    ret
+}
+
+fn decode_token_cashaddr(addr: &str) -> Result<DecodedAddr, AddressError> {
+    let parts: Vec<&str> = addr.split(':').collect();
+    if parts.len() != 2 {
+        return Err(AddressError::InvalidAddress("missing prefix".into()));
+    }
+    let prefix = parts[0];
+    let payload_str = parts[1];
+
+    let network = match prefix {
+        "bitcoincash" => "mainnet",
+        "bchtest" => "testnet",
+        "bchreg" => "regtest",
+        _ => return Err(AddressError::InvalidAddress(format!("unknown prefix: {prefix}"))),
+    };
+
+    // Decode base32 payload
+    let payload_5_bits: Result<Vec<u8>, _> = payload_str
+        .chars()
+        .map(|c| {
+            let i = c as usize;
+            CHARSET_REV
+                .get(i)
+                .and_then(|v| *v)
+                .ok_or_else(|| AddressError::InvalidAddress(format!("invalid char: {c}")))
+        })
+        .collect();
+    let payload_5_bits = payload_5_bits?;
+
+    // Verify checksum
+    let checksum = polymod(&[&expand_prefix(prefix), &payload_5_bits[..]].concat());
+    if checksum != 0 {
+        return Err(AddressError::InvalidAddress("checksum failed".into()));
+    }
+
+    // Convert from 5-bit to 8-bit (strip 8 checksum characters)
+    let len = payload_5_bits.len();
+    let payload = convert_bits(&payload_5_bits[..(len - 8)], 5, 8);
+
+    let version = payload[0];
+    let body = &payload[1..];
+
+    if body.len() != 20 {
+        return Err(AddressError::InvalidAddress(format!(
+            "unexpected hash length: {}",
+            body.len()
+        )));
+    }
+
+    let version_type = version & TYPE_MASK;
+    let script_type = match version_type {
+        TYPE_P2PKH | TYPE_TOKEN_P2PKH => ScriptType::P2PKH,
+        TYPE_P2SH | TYPE_TOKEN_P2SH => ScriptType::P2SH,
+        _ => {
+            return Err(AddressError::InvalidAddress(format!(
+                "unsupported version byte: 0x{version:02x}"
+            )))
+        }
+    };
+
+    Ok(DecodedAddr {
+        network: network.to_string(),
+        script_type,
+        hash: body.to_vec(),
+    })
+}
+
+// ── Public API ───────────────────────────────────────────────────────
+
+/// Convert a cashaddr (including CashToken z/r-prefix) to Electrum scripthash.
+///
+/// Algorithm:
+/// 1. Decode cashaddr → script_type + hash160 bytes
 /// 2. Build output script:
 ///    - P2PKH: `OP_DUP OP_HASH160 <20-byte-hash> OP_EQUALVERIFY OP_CHECKSIG`
 ///    - P2SH:  `OP_HASH160 <20-byte-hash> OP_EQUAL`
 /// 3. SHA256(script) → reverse bytes → hex
+///
+/// Token-aware addresses (z/r-prefix) share the same hash160 as their
+/// regular counterparts (q/p-prefix), so the scripthash is identical.
 pub fn address_to_scripthash(addr: &str) -> Result<String, AddressError> {
-    let decoded = bitcoincash_addr::Address::decode(addr)
-        .map_err(|e| AddressError::InvalidAddress(format!("{e:?}")))?;
+    let decoded = decode_cashaddr(addr)?;
 
-    let hash = &decoded.body;
-
-    let script = match decoded.hash_type {
-        bitcoincash_addr::HashType::Key => {
-            // P2PKH: OP_DUP OP_HASH160 0x14 <hash160> OP_EQUALVERIFY OP_CHECKSIG
+    let script = match decoded.script_type {
+        ScriptType::P2PKH => {
             let mut s = Vec::with_capacity(25);
             s.push(0x76); // OP_DUP
             s.push(0xa9); // OP_HASH160
             s.push(0x14); // push 20 bytes
-            s.extend_from_slice(hash);
+            s.extend_from_slice(&decoded.hash);
             s.push(0x88); // OP_EQUALVERIFY
             s.push(0xac); // OP_CHECKSIG
             s
         }
-        bitcoincash_addr::HashType::Script => {
-            // P2SH: OP_HASH160 0x14 <hash160> OP_EQUAL
+        ScriptType::P2SH => {
             let mut s = Vec::with_capacity(23);
             s.push(0xa9); // OP_HASH160
             s.push(0x14); // push 20 bytes
-            s.extend_from_slice(hash);
+            s.extend_from_slice(&decoded.hash);
             s.push(0x87); // OP_EQUAL
             s
         }
@@ -64,19 +249,19 @@ pub fn address_to_scripthash(addr: &str) -> Result<String, AddressError> {
     Ok(hex::encode(reversed))
 }
 
-/// Validate that the decoded address network matches the configured network string.
+/// Validate that the address network matches the configured network string.
+/// Supports both regular (q/p) and token-aware (z/r) address prefixes.
 pub fn validate_network(addr: &str, network: &str) -> Result<(), AddressError> {
-    let decoded = bitcoincash_addr::Address::decode(addr)
-        .map_err(|e| AddressError::InvalidAddress(format!("{e:?}")))?;
+    let decoded = decode_cashaddr(addr)?;
 
     let expected = match network {
-        "mainnet" => bitcoincash_addr::Network::Main,
-        "testnet" | "testnet3" => bitcoincash_addr::Network::Test,
-        "regtest" => bitcoincash_addr::Network::Regtest,
+        "mainnet" => "mainnet",
+        "testnet" | "testnet3" => "testnet",
+        "regtest" => "regtest",
         other => {
             return Err(AddressError::InvalidNetwork {
                 expected: other.to_string(),
-                got: format!("{:?}", decoded.network),
+                got: decoded.network,
             })
         }
     };
@@ -84,7 +269,7 @@ pub fn validate_network(addr: &str, network: &str) -> Result<(), AddressError> {
     if decoded.network != expected {
         return Err(AddressError::InvalidNetwork {
             expected: network.to_string(),
-            got: format!("{:?}", decoded.network),
+            got: decoded.network,
         });
     }
 
@@ -146,6 +331,31 @@ mod tests {
             AddressError::InvalidNetwork { .. } => {}
             other => panic!("expected InvalidNetwork, got: {other}"),
         }
+    }
+
+    #[test]
+    fn z_prefix_same_scripthash_as_q_prefix() {
+        // z-prefix (token-aware P2PKH) and q-prefix (regular P2PKH)
+        // share the same hash160, so scripthash must be identical.
+        let q_addr = "bitcoincash:qzx8rpy6ravy6uz5gpchjt83z94srp8y0u2nj0yw7d";
+        let z_addr = "bitcoincash:zzx8rpy6ravy6uz5gpchjt83z94srp8y0udep32gp7";
+
+        let q_hash = address_to_scripthash(q_addr).unwrap();
+        let z_hash = address_to_scripthash(z_addr).unwrap();
+        assert_eq!(q_hash, z_hash);
+    }
+
+    #[test]
+    fn z_prefix_validates_mainnet() {
+        let z_addr = "bitcoincash:zzx8rpy6ravy6uz5gpchjt83z94srp8y0udep32gp7";
+        assert!(validate_network(z_addr, "mainnet").is_ok());
+    }
+
+    #[test]
+    fn z_prefix_rejects_wrong_network() {
+        let z_addr = "bitcoincash:zzx8rpy6ravy6uz5gpchjt83z94srp8y0udep32gp7";
+        let result = validate_network(z_addr, "testnet");
+        assert!(result.is_err());
     }
 
     #[test]

@@ -107,7 +107,7 @@ impl ElectrumClient {
 
         // Handshake
         let version = self
-            .raw_request("server.version", &json!(["fulcrum-rust", "1.4.1"]))
+            .raw_request("server.version", &json!(["fulcrum-rust", "1.5"]))
             .await?;
         info!("Fulcrum handshake OK: {version}");
 
@@ -298,10 +298,10 @@ mod tests {
 
     #[test]
     fn build_request_format() {
-        let req = build_request("server.version", json!(["client", "1.4.1"]), 1);
+        let req = build_request("server.version", json!(["client", "1.5"]), 1);
         assert_eq!(req["method"], "server.version");
         assert_eq!(req["params"][0], "client");
-        assert_eq!(req["params"][1], "1.4.1");
+        assert_eq!(req["params"][1], "1.5");
         assert_eq!(req["id"], 1);
     }
 
@@ -344,10 +344,10 @@ mod tests {
     #[test]
     fn parse_success_response() {
         let resp: Value =
-            serde_json::from_str(r#"{"result":["Fulcrum 1.9.1","1.4.1"],"id":1}"#).unwrap();
+            serde_json::from_str(r#"{"result":["Fulcrum 2.1.0","1.5"],"id":1}"#).unwrap();
         let result = resp.get("result").unwrap();
         assert!(result.is_array());
-        assert_eq!(result[0], "Fulcrum 1.9.1");
+        assert_eq!(result[0], "Fulcrum 2.1.0");
     }
 
     #[test]

@@ -48,7 +48,7 @@ async fn mock_electrum_server(listener: TcpListener) {
                 let method = req["method"].as_str().unwrap_or("");
 
                 let result = match method {
-                    "server.version" => json!(["MockFulcrum 1.0.0", "1.4.1"]),
+                    "server.version" => json!(["MockFulcrum 2.1.0", "1.5"]),
 
                     "blockchain.scripthash.listunspent" => json!([
                         {
@@ -61,7 +61,11 @@ async fn mock_electrum_server(listener: TcpListener) {
                             "height": 630834,
                             "tx_hash": "4fe60a51e0d8f5134bfd8e5f872d6e502d7f01b28a6afebb27f4438a4f638d53",
                             "tx_pos": 0,
-                            "value": 6000
+                            "value": 6000,
+                            "token_data": {
+                                "category": "ea38c6a264d5653220ffe691f424a80491b0c4c80dd70bbdd70d4ebe453b202b",
+                                "amount": "100"
+                            }
                         }
                     ]),
 
@@ -316,6 +320,17 @@ async fn get_utxos_success() {
     );
     assert_eq!(utxos[0]["tx_pos"], 0);
     assert_eq!(utxos[0]["value"], 1000);
+    // First UTXO has no token_data
+    assert!(utxos[0].get("token_data").is_none());
+
+    // Second UTXO has token_data (CashToken) -- verify passthrough
+    assert_eq!(utxos[1]["value"], 6000);
+    let token = &utxos[1]["token_data"];
+    assert_eq!(
+        token["category"],
+        "ea38c6a264d5653220ffe691f424a80491b0c4c80dd70bbdd70d4ebe453b202b"
+    );
+    assert_eq!(token["amount"], "100");
 }
 
 #[tokio::test]
